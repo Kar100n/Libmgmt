@@ -14,6 +14,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+const defaultOwnerEmail = "default_owner@example.com"
+const defaultOwnerRole = "owner"
+
 // User represents a user in the system
 type User struct {
 	ID            int    `json:"id"`
@@ -101,14 +104,13 @@ func AuthMiddleware(role string) gin.HandlerFunc {
 		defer db.Close()
 
 		var user User
-		err = db.QueryRow("SELECT ID, Name, Email, ContactNumber, Role, LibID, Password FROM Users WHERE Email = ?", email).Scan(&user.ID, &user.Name, &user.Email, &user.ContactNumber, &user.Role, &user.LibID, &user.Password)
+		err = db.QueryRow("SELECT ID, Name, Email, ContactNumber, Role, LibID, Password FROM Users WHERE Email =?", email).Scan(&user.ID, &user.Name, &user.Email, &user.ContactNumber, &user.Role, &user.LibID, &user.Password)
 		if err != nil {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
 
-		err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password))
-		if err != nil {
+		if user.Password != password {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
@@ -123,39 +125,48 @@ func AuthMiddleware(role string) gin.HandlerFunc {
 	}
 }
 
-func main() {
-
+func initDatabase() {
 	db, err := sql.Open("sqlite3", "library.db")
 	if err != nil {
-
 		log.Fatal(err)
-
 	}
 	defer db.Close()
 
-	// Read the SQL statements from the schema.sql file
-
 	schemaBytes, err := os.ReadFile("Schema.sql")
-
 	if err != nil {
-
 		log.Fatal(err)
-
 	}
 
-	// Execute the SQL statements to create the tables
-
 	_, err = db.Exec(string(schemaBytes))
-
 	if err != nil {
-
 		log.Printf("%q: %s\n", err, string(schemaBytes))
-
 		return
-
 	}
 
 	fmt.Println("Tables created successfully!")
+
+	// Check if a default owner user exists
+	var defaultUser User
+	defaultUser.Email = defaultOwnerEmail
+	defaultUser.Role = defaultOwnerRole
+	defaultUser.LibID = 1
+	err = db.QueryRow("SELECT ID, Name, ContactNumber FROM Users WHERE Email = ? AND Role = ? AND LibID = ?", defaultUser.Email, defaultUser.Role, defaultUser.LibID).Scan(&defaultUser.ID, &defaultUser.Name, &defaultUser.ContactNumber)
+	if err != nil {
+		fmt.Println("Error querying Users table:", err)
+		// If not, create a default owner user
+		defaultUser.Name = "Root"
+		defaultUser.ContactNumber = "1234567890"
+		defaultUser.Password = "password"
+		_, err = db.Exec("INSERT INTO Users (Name, Email, ContactNumber, Password, Role, LibID) VALUES (?, ?, ?, ?, ?, ?)", defaultUser.Name, defaultUser.Email, defaultUser.ContactNumber, defaultUser.Password, defaultUser.Role, defaultUser.LibID)
+		if err != nil {
+			fmt.Println("Error inserting default owner user:", err)
+			return
+		}
+	}
+}
+
+func main() {
+	initDatabase()
 
 	r := gin.Default()
 
