@@ -216,13 +216,15 @@ func createLibrary(c *gin.Context) {
 	}
 	defer stmt.Close()
 
-	_, err = stmt.Exec(lib.Name)
+	result, err := stmt.Exec(lib.Name)
 	if err != nil {
 		c.AbortWithError(http.StatusInternalServerError, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, lib)
+	id, _ := result.LastInsertId()
+	lib.ID = int(id)
+	c.JSON(http.StatusCreated, lib)
 }
 
 func createUser(c *gin.Context) {
@@ -239,13 +241,36 @@ func createUser(c *gin.Context) {
 	}
 	defer db.Close()
 
-	err = CreateUser(db, user.Name, user.Email, user.ContactNumber, user.Password, user.Role, user.LibID)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	user.Password = string(hashedPassword)
+
+	stmt, err := db.Prepare("INSERT INTO users (name, email, ContactNumber, Password, role, LibID) VALUES (?,?,?,?,?,?)")
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	defer stmt.Close()
+
+	result, err := stmt.Exec(user.Name, user.Email, user.ContactNumber, user.Password, user.Role, user.LibID)
 	if err != nil {
 		c.AbortWithError(http.StatusInternalServerError, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, user)
+	id, err := result.LastInsertId()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	user.ID = int(id)
+
+	c.JSON(http.StatusCreated, user)
 }
 
 func addBook(c *gin.Context) {
@@ -353,10 +378,25 @@ func listIssueRequests(c *gin.Context) {
 	var requests []RequestEvent
 	for rows.Next() {
 		var req RequestEvent
-		if err := rows.Scan(&req.ReqID, &req.BookID, &req.ReaderID, &req.RequestDate, &req.ApprovalDate, &req.ApproverID, &req.RequestType); err != nil {
+		var approvalDate sql.NullTime
+		var approverID sql.NullInt64
+		if err := rows.Scan(&req.ReqID, &req.BookID, &req.ReaderID, &req.RequestDate, &approvalDate, &approverID, &req.RequestType); err != nil {
 			c.AbortWithError(http.StatusInternalServerError, err)
 			return
 		}
+
+		if approvalDate.Valid {
+			req.ApprovalDate = approvalDate.Time
+		} else {
+			req.ApprovalDate = time.Time{}
+		}
+
+		if approverID.Valid {
+			req.ApproverID = int(approverID.Int64)
+		} else {
+			req.ApproverID = 0
+		}
+
 		requests = append(requests, req)
 	}
 
