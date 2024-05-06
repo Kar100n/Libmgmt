@@ -222,32 +222,6 @@ func createLibrary(c *gin.Context) {
 		return
 	}
 
-	// Check if a default owner user exists
-	var defaultUser User
-	defaultUser.Email = "default_owner@example.com"
-	defaultUser.Role = "owner"
-	defaultUser.LibID = lib.ID
-	err = db.QueryRow("SELECT ID, Name, ContactNumber, Password FROM Users WHERE Email = ? AND Role = ? AND LibID = ?", defaultUser.Email, defaultUser.Role, defaultUser.LibID).Scan(&defaultUser.ID, &defaultUser.Name, &defaultUser.ContactNumber, &defaultUser.Password)
-	if err != nil {
-		fmt.Println("Error querying Users table:", err)
-		// If not, create a default owner user
-		defaultUser.Name = "Root"
-		defaultUser.ContactNumber = "1234567890"
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
-		if err != nil {
-			fmt.Println("Error generating hashed password:", err)
-			c.AbortWithError(http.StatusInternalServerError, err)
-			return
-		}
-		defaultUser.Password = string(hashedPassword)
-		_, err = db.Exec("INSERT INTO Users (Name, Email, ContactNumber, Password, Role, LibID) VALUES (?, ?, ?, ?, ?, ?)", defaultUser.Name, defaultUser.Email, defaultUser.ContactNumber, defaultUser.Password, defaultUser.Role, defaultUser.LibID)
-		if err != nil {
-			fmt.Println("Error inserting default owner user:", err)
-			c.AbortWithError(http.StatusInternalServerError, err)
-			return
-		}
-	}
-
 	c.JSON(http.StatusOK, lib)
 }
 
