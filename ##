@@ -1,0 +1,86 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/skip2/go-qrcode"
+)
+
+const (
+	errorMsgFailedToUpdateBook      = "Failed to update book"
+	errorMsgFailedToGenerateQRCode  = "Failed to generate QR code"
+	errorMsgFailedToSaveQRCodeImage = "Failed to save QR code image to file"
+)
+
+type requestBody struct {
+	LibID           uint   `json:"library_id" binding:"required"`
+	ISBN            string `json:"isbn" binding:"required"`
+	Title           string `json:"title" binding:"required"`
+	Authors         string `json:"authors" binding:"required"`
+	Publisher       string `json:"publisher" binding:"required"`
+	Version         string `json:"version" binding:"required"`
+	TotalCopies     uint   `json:"total_copies" binding:"required"`
+	AvailableCopies uint   `json:"available_copies" binding:"required"`
+}
+
+func handleError(c *gin.Context, err error, statusCode int, message string) {
+	c.JSON(statusCode, gin.H{"error": message})
+}
+
+func generateQRCode(book BookInventory) (string, error) {
+	qrContent := fmt.Sprintf("Title: %s\nAuthor: %s\nISBN: %s\nVersion: %s", book.Title, book.Authors, book.ISBN, book.Version)
+	qrFilename := fmt.Sprintf("qr_%s.png", book.ISBN)
+	qrFilePath := "./qr_codes/" + qrFilename
+	err := qrcode.WriteFile(qrContent, qrcode.Medium, 256, qrFilePath)
+	if err != nil {
+		log.Println("Error generating QR code:", err)
+		return "", err
+	}
+	return qrFilePath, nil
+}
+
+func addBook(c *gin.Context) {
+	var req requestBody
+	if err := c.BindJSON(&req); err != nil {
+		handleError(c, err, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	// Check if the book already exists
+	var existingBook BookInventory
+	if err := db.Where("isbn =?", req.ISBN).First(&existingBook).Error; err == nil {
+		// If the book already exists, update the number of copies
+		existingBook.TotalCopies += req.TotalCopies
+		existingBook.AvailableCopies += req.AvailableCopies
+		if err := db.Save(&existingBook).Error; err != nil {
+			handleError(c, err, http.StatusInternalServerError, errorMsgFailedToUpdateBook)
+			return
+		}
+		c.JSON(http.StatusOK, existingBook)
+		return
+	}
+
+	// Create a new book entry
+	newBook := BookInventory{
+		ID:              0,
+		LibID:           req.LibID,
+		ISBN:            req.ISBN,
+		Title:           req.Title,
+		Authors:         req.Authors,
+		Publisher:       req.Publisher,
+		Version:         req.Version,
+		TotalCopies:     req.TotalCopies,
+		AvailableCopies: req.AvailableCopies,
+	}
+
+	qrCodePath, err := generateQRCode(newBook)
+	if err != nil {
+		handleError(c, err, http.StatusInternalServerError, errorMsgFailedToGenerateQRCode)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Book added successfully", "qr_code": qrCodePath})
+}

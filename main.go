@@ -1,608 +1,405 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/skip2/go-qrcode" // Importing go-qrcode package
-	"golang.org/x/crypto/bcrypt"
+	"github.com/jinzhu/gorm"
+	_ "github.com/jinzhu/gorm/dialects/sqlite"
+	"github.com/skip2/go-qrcode"
 )
 
-const defaultOwnerEmail = "default_owner@example.com"
-const defaultOwnerRole = "owner"
+var db *gorm.DB
 
-// User represents a user in the system
-type User struct {
-	ID            int    `json:"id"`
-	Name          string `json:"name"`
-	Email         string `json:"email"`
-	ContactNumber string `json:"contact_number"`
-	Role          string `json:"role"`
-	LibID         int    `json:"lib_id"`
-	Password      string `json:"-"`
-}
-
-// Library represents a library
+// Models
 type Library struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
+	ID   uint   `gorm:"primary_key"`
+	Name string `gorm:"unique"`
 }
 
-// BookInventory represents a book in the inventory
+type User struct {
+	ID            uint
+	Name          string
+	Email         string
+	ContactNumber string
+	Role          string
+	LibID         uint
+}
+
 type BookInventory struct {
-	ISBN            string `json:"isbn"`
-	LibID           int    `json:"lib_id"`
-	Title           string `json:"title"`
-	Authors         string `json:"authors"`
-	Publisher       string `json:"publisher"`
-	Version         string `json:"version"`
-	TotalCopies     int    `json:"total_copies"`
-	AvailableCopies int    `json:"available_copies"`
+	ID              uint `gorm:"primary_key"`
+	LibID           uint
+	ISBN            string `gorm:"unique"`
+	Title           string
+	Authors         string
+	Publisher       string
+	Version         string
+	TotalCopies     uint
+	AvailableCopies uint
 }
 
-// RequestEvent represents a book request event
-type RequestEvent struct {
-	ReqID        int       `json:"req_id"`
-	BookID       string    `json:"book_id"`
-	ReaderID     int       `json:"reader_id"`
-	RequestDate  time.Time `json:"request_date"`
-	ApprovalDate time.Time `json:"approval_date"`
-	ApproverID   int       `json:"approver_id"`
-	RequestType  string    `json:"request_type"`
+type RequestEvents struct {
+	ReqID        uint `gorm:"primary_key"`
+	BookID       uint
+	ReaderID     string
+	RequestDate  time.Time
+	ApprovalDate *time.Time
+	ApproverID   *uint
+	RequestType  string
 }
 
-// IssueRegistry represents an issued book
 type IssueRegistry struct {
-	IssueID            int       `json:"issue_id"`
-	ISBN               string    `json:"isbn"`
-	ReaderID           int       `json:"reader_id"`
-	IssueApproverID    int       `json:"issue_approver_id"`
-	IssueStatus        string    `json:"issue_status"`
-	IssueDate          time.Time `json:"issue_date"`
-	ExpectedReturnDate time.Time `json:"expected_return_date"`
-	ReturnDate         time.Time `json:"return_date"`
-	ReturnApproverID   int       `json:"return_approver_id"`
-}
-
-// createUser creates a new user
-func createUser(c *gin.Context) {
-	var user User
-	if err := c.BindJSON(&user); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
-		return
-	}
-
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	// Check if the user is trying to create an owner for an existing library
-	if user.Role == defaultOwnerRole {
-		var existingOwnerID int
-		err = db.QueryRow("SELECT ID FROM Users WHERE Role = ? AND LibID = ?", defaultOwnerRole, user.LibID).Scan(&existingOwnerID)
-		if err == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Owner already exists for this library"})
-			return
-		} else if err != sql.ErrNoRows {
-			c.AbortWithError(http.StatusInternalServerError, err)
-			return
-		}
-	}
-
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	user.Password = string(hashedPassword)
-
-	stmt, err := db.Prepare("INSERT INTO users (name, email, ContactNumber, Password, role, LibID) VALUES (?,?,?,?,?,?)")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
-
-	result, err := stmt.Exec(user.Name, user.Email, user.ContactNumber, user.Password, user.Role, user.LibID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	user.ID = int(id)
-
-	c.JSON(http.StatusCreated, user)
-}
-
-// AuthMiddleware is a middleware for authentication
-func AuthMiddleware(role string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		email, password, ok := c.Request.BasicAuth()
-		if !ok {
-			c.AbortWithStatus(http.StatusUnauthorized)
-			return
-		}
-
-		db, err := sql.Open("sqlite3", "library.db")
-		if err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
-			return
-		}
-		defer db.Close()
-
-		var user User
-		err = db.QueryRow("SELECT ID, Name, Email, ContactNumber, Role, LibID, Password FROM Users WHERE Email =?", email).Scan(&user.ID, &user.Name, &user.Email, &user.ContactNumber, &user.Role, &user.LibID, &user.Password)
-		if err != nil {
-			c.AbortWithStatus(http.StatusUnauthorized)
-			return
-		}
-
-		if user.Password != password {
-			c.AbortWithStatus(http.StatusUnauthorized)
-			return
-		}
-
-		if !strings.EqualFold(user.Role, role) {
-			c.AbortWithStatus(http.StatusForbidden)
-			return
-		}
-
-		c.Set("user", user)
-		c.Next()
-	}
-}
-
-func initDatabase() {
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	schemaBytes, err := os.ReadFile("Schema.sql")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	_, err = db.Exec(string(schemaBytes))
-	if err != nil {
-		log.Printf("%q: %s\n", err, string(schemaBytes))
-		return
-	}
-
-	fmt.Println("Tables created successfully!")
-
-	// Check if a default owner user exists
-	var defaultUser User
-	defaultUser.Email = defaultOwnerEmail
-	defaultUser.Role = defaultOwnerRole
-	defaultUser.LibID = 1
-	err = db.QueryRow("SELECT ID, Name, ContactNumber FROM Users WHERE Email = ? AND Role = ? AND LibID = ?", defaultUser.Email, defaultUser.Role, defaultUser.LibID).Scan(&defaultUser.ID, &defaultUser.Name, &defaultUser.ContactNumber)
-	if err != nil {
-		fmt.Println("Error querying Users table:", err)
-		// If not, create a default owner user
-		defaultUser.Name = "Root"
-		defaultUser.ContactNumber = "1234567890"
-		defaultUser.Password = "password"
-		_, err = db.Exec("INSERT INTO Users (Name, Email, ContactNumber, Password, Role, LibID) VALUES (?, ?, ?, ?, ?, ?)", defaultUser.Name, defaultUser.Email, defaultUser.ContactNumber, defaultUser.Password, defaultUser.Role, defaultUser.LibID)
-		if err != nil {
-			fmt.Println("Error inserting default owner user:", err)
-			return
-		}
-	}
+	IssueID            uint `gorm:"primary_key"`
+	ISBN               string
+	ReaderID           string
+	IssueApproverID    *uint
+	IssueStatus        string
+	IssueDate          time.Time
+	ExpectedReturnDate time.Time
+	ReturnDate         *time.Time
+	ReturnApproverID   *uint
 }
 
 func main() {
-	initDatabase()
-
 	r := gin.Default()
 
-	owner := r.Group("/owner", AuthMiddleware("owner"))
+	var err error
+	db, err = gorm.Open("sqlite3", "library.db")
+	if err != nil {
+		panic("failed to connect database")
+	}
+	defer db.Close()
+
+	db.AutoMigrate(&Library{}, &User{}, &BookInventory{}, &RequestEvents{}, &IssueRegistry{})
+
+	// Grouping APIs by role
+	adminGroup := r.Group("/admin")
 	{
-		owner.POST("/libraries", createLibrary)
-		owner.POST("/users", createUser)
+		adminGroup.POST("/libraries", createLibrary)
+		adminGroup.POST("/books", addBook)
+		adminGroup.DELETE("/books/:isbn", removeBook)
+		adminGroup.PUT("/books/:isbn", updateBook)
+		adminGroup.GET("/issue-requests", listIssueRequests)
+		adminGroup.PUT("/issue-requests/:id", approveOrRejectIssueRequest)
+		adminGroup.POST("/users", AddUser)
 	}
 
-	admin := r.Group("/admin", AuthMiddleware("admin"))
+	readerGroup := r.Group("/reader")
 	{
-		admin.POST("/books", addBook)
-		admin.POST("/users", createUser)
-		admin.PUT("/books/:isbn", updateBook)
-		admin.DELETE("/books/:isbn", removeBook)
-		admin.GET("/requests", listIssueRequests)
-		admin.POST("/requests/:reqID", approveIssueRequest)
-		admin.GET("/readers/:readerID", getReaderInfo)
+		readerGroup.POST("/search", searchBook)
+		readerGroup.POST("/issue-requests", raiseIssueRequest)
 	}
 
-	reader := r.Group("/reader", AuthMiddleware("reader"))
-	{
-		reader.POST("/requests", issueBookRequest)
-		reader.GET("/books", listAvailableBooks)
-	}
-
-	r.Run(":8081")
+	r.Run(":8080")
 }
 
+// Admin APIs
 func createLibrary(c *gin.Context) {
-	var lib Library
-	if err := c.BindJSON(&lib); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
+	var req struct {
+		Name string `json:"name" binding:"required"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	stmt, err := db.Prepare("INSERT INTO Library (Name) VALUES (?)")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
-
-	result, err := stmt.Exec(lib.Name)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
+	var existingLibrary Library
+	if err := db.Where("name = ?", req.Name).First(&existingLibrary).Error; err == nil {
+		c.JSON(400, gin.H{"error": "Library with the same name already exists"})
 		return
 	}
 
-	id, _ := result.LastInsertId()
-	lib.ID = int(id)
-	c.JSON(http.StatusCreated, lib)
+	newLibrary := Library{Name: req.Name}
+	if err := db.Create(&newLibrary).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to create library"})
+		return
+	}
+
+	newUser := User{Name: "Owner", Role: "Owner", LibID: newLibrary.ID}
+	if err := db.Create(&newUser).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to add owner to the library"})
+		return
+	}
+
+	c.JSON(200, newLibrary)
 }
 
-func CreateUser(c *gin.Context) {
-	var user User
-	if err := c.BindJSON(&user); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
+func AddUser(c *gin.Context) {
+	var req struct {
+		Name          string `json:"name" binding:"required"`
+		Email         string `json:"email" binding:"required"`
+		ContactNumber string `json:"contact_number" binding:"required"`
+		Role          string `json:"role" binding:"required"`
+		LibID         uint   `json:"library_id" binding:"required"`
+	}
+
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	// Check if the library exists
+	var library Library
+	if err := db.Where("id = ?", req.LibID).First(&library).Error; err != nil {
+		c.JSON(400, gin.H{"error": "Library not found"})
 		return
 	}
 
-	user.Password = string(hashedPassword)
-
-	stmt, err := db.Prepare("INSERT INTO users (name, email, ContactNumber, Password, role, LibID) VALUES (?,?,?,?,?,?)")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
-
-	result, err := stmt.Exec(user.Name, user.Email, user.ContactNumber, user.Password, user.Role, user.LibID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
+	// Check if the user with the same email already exists in the library
+	var existingUser User
+	if err := db.Where("email = ? AND lib_id = ?", req.Email, req.LibID).First(&existingUser).Error; err == nil {
+		c.JSON(400, gin.H{"error": "User with the same email already exists in the library"})
 		return
 	}
 
-	id, err := result.LastInsertId()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	newUser := User{
+		Name:          req.Name,
+		Email:         req.Email,
+		ContactNumber: req.ContactNumber,
+		Role:          req.Role,
+		LibID:         req.LibID,
+	}
+
+	if err := db.Create(&newUser).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to create user"})
 		return
 	}
 
-	user.ID = int(id)
-
-	c.JSON(http.StatusCreated, user)
+	c.JSON(200, newUser)
 }
 
-// addBook allows a library admin to add books to the inventory
+func handleError(c *gin.Context, _ error, statusCode int, message string) {
+	c.JSON(statusCode, gin.H{"error": message})
+}
+
+// Function to add books to the inventory
 func addBook(c *gin.Context) {
-	user, _ := c.Get("user")
-	userObj := user.(User)
-
-	var book BookInventory
-	if err := c.BindJSON(&book); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
+	var req struct {
+		LibID           uint   `json:"library_id" binding:"required"`
+		ISBN            string `json:"isbn" binding:"required"`
+		Title           string `json:"title" binding:"required"`
+		Authors         string `json:"authors" binding:"required"`
+		Publisher       string `json:"publisher" binding:"required"`
+		Version         string `json:"version" binding:"required"`
+		TotalCopies     uint   `json:"total_copies" binding:"required"`
+		AvailableCopies uint   `json:"available_copies" binding:"required"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	// Check if the book already exists in the inventory
-	var existingBookID int
-	err = db.QueryRow("SELECT ISBN FROM BookInventory WHERE LibID = ? AND ISBN = ?", userObj.LibID, book.ISBN).Scan(&existingBookID)
-	if err == nil {
-		// Book already exists, increment the available copies
-		_, err = db.Exec("UPDATE BookInventory SET TotalCopies = TotalCopies + ?, AvailableCopies = AvailableCopies + ? WHERE ID = ?", book.TotalCopies, book.TotalCopies, existingBookID)
-		if err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
+	var existingBook BookInventory
+	if err := db.Where("isbn = ?", req.ISBN).First(&existingBook).Error; err == nil {
+		// If the book already exists, update the number of copies
+		existingBook.TotalCopies += req.TotalCopies
+		existingBook.AvailableCopies += req.AvailableCopies
+		if err := db.Save(&existingBook).Error; err != nil {
+			handleError(c, err, http.StatusInternalServerError, "Failed to update book")
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"message": "Book already exists, copies incremented"})
-		return
-	} else if err != sql.ErrNoRows {
-		c.AbortWithError(http.StatusInternalServerError, err)
+		c.JSON(200, existingBook)
 		return
 	}
 
-	// Book doesn't exist, insert a new record
-	stmt, err := db.Prepare("INSERT INTO BookInventory (ISBN, LibID, Title, Authors, Publisher, Version, TotalCopies, AvailableCopies) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	// Create a new book entry
+	newBook := BookInventory{
+		LibID:           req.LibID,
+		ISBN:            req.ISBN,
+		Title:           req.Title,
+		Authors:         req.Authors,
+		Publisher:       req.Publisher,
+		Version:         req.Version,
+		TotalCopies:     req.TotalCopies,
+		AvailableCopies: req.AvailableCopies,
+	}
+
+	if err := db.Create(&newBook).Error; err != nil {
+		handleError(c, err, http.StatusInternalServerError, "Failed to add book")
+		return
+	}
+
+	qrCodePath, err := generateQRCode(newBook)
 	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(book.ISBN, userObj.LibID, book.Title, book.Authors, book.Publisher, book.Version, book.TotalCopies, book.TotalCopies)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
+		handleError(c, err, http.StatusInternalServerError, "Failed to generate QR code")
 		return
 	}
 
-	// Generate QR code with book details
+	c.JSON(http.StatusOK, gin.H{"message": "Book added successfully", "qr_code": qrCodePath})
+}
+
+// Function to generate a QR code
+func generateQRCode(book BookInventory) (string, error) {
 	qrContent := fmt.Sprintf("Title: %s\nAuthor: %s\nISBN: %s\nVersion: %s", book.Title, book.Authors, book.ISBN, book.Version)
-	qrFilename := fmt.Sprintf("qr_%s.png", book.ISBN) // Naming QR code file with ISBN
-	qrFilePath := "./qr_codes/" + qrFilename          // Path to store the QR code file
-	err = qrcode.WriteFile(qrContent, qrcode.Medium, 256, qrFilePath)
+	qrFilename := fmt.Sprintf("qr_%s.png", book.ISBN)
+	qrFilePath := "./qr_codes/" + qrFilename
+	err := qrcode.WriteFile(qrContent, qrcode.Medium, 256, qrFilePath)
 	if err != nil {
 		log.Println("Error generating QR code:", err)
-		// Handle error if needed
+		return "", err
 	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Book added successfully", "qr_code": qrFilePath})
+	return qrFilePath, nil
 }
 
-// updateBook allows a library admin to update the details of a book
-func updateBook(c *gin.Context) {
-	user, _ := c.Get("user")
-	userObj := user.(User)
-
-	isbn := c.Param("isbn")
+func removeBook(c *gin.Context) {
+	var req struct {
+		BookID uint `json:"book_id" binding:"required"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
 
 	var book BookInventory
-	if err := c.BindJSON(&book); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
+	if err := db.First(&book, req.BookID).Error; err != nil {
+		c.JSON(404, gin.H{"error": "Book not found"})
 		return
 	}
 
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	// Check if the book exists in the inventory
-	var existingBookID int
-	err = db.QueryRow("SELECT ID FROM BookInventory WHERE LibID = ? AND ISBN = ?", userObj.LibID, isbn).Scan(&existingBookID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Book not found in the inventory"})
-		} else {
-			c.AbortWithError(http.StatusInternalServerError, err)
-		}
+	if book.TotalCopies <= 0 {
+		c.JSON(400, gin.H{"error": "No copies of this book available"})
 		return
 	}
 
-	// Update the book details
-	stmt, err := db.Prepare("UPDATE BookInventory SET Title = ?, Authors = ?, Publisher = ?, Version = ?, TotalCopies = ? WHERE ID = ?")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(book.Title, book.Authors, book.Publisher, book.Version, book.TotalCopies, existingBookID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Book details updated successfully"})
-}
-
-// removeBook allows a library admin to remove a book from the inventory
-func removeBook(c *gin.Context) {
-	user, _ := c.Get("user")
-	userObj := user.(User)
-
-	isbn := c.Param("isbn")
-
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	// Check if the book exists in the inventory
-	var existingBookID int
-	err = db.QueryRow("SELECT ID FROM BookInventory WHERE LibID = ? AND ISBN = ?", userObj.LibID, isbn).Scan(&existingBookID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Book not found in the inventory"})
-		} else {
-			c.AbortWithError(http.StatusInternalServerError, err)
-		}
-		return
-	}
-
-	// Check if there are any issued copies of the book
-	var issuedCopies int
-	err = db.QueryRow("SELECT COUNT(*) FROM IssueRegistry WHERE ISBN = ? AND IssueStatus = 'issued'", isbn).Scan(&issuedCopies)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
+	// Check if any copies are issued
+	var issuedCopies uint
+	if err := db.Model(&RequestEvents{}).Where("book_id = ? AND request_type = ?", req.BookID, "Issue").Count(&issuedCopies).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to check issued copies"})
 		return
 	}
 
 	if issuedCopies > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot remove book with issued copies"})
+		c.JSON(400, gin.H{"error": "Some copies of this book are issued and cannot be removed"})
 		return
 	}
 
-	// Remove the book from the inventory
-	stmt, err := db.Prepare("DELETE FROM BookInventory WHERE ID = ?")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(existingBookID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
+	// Decrement the number of copies
+	book.TotalCopies--
+	book.AvailableCopies--
+	if err := db.Save(&book).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to remove book"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Book removed successfully"})
+	c.JSON(200, gin.H{"message": "Book removed successfully"})
 }
 
-// listIssueRequests allows a library admin to list issue requests in their library
-func listIssueRequests(c *gin.Context) {
-	user, _ := c.Get("user")
-	userObj := user.(User)
-
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
+func updateBook(c *gin.Context) {
+	var req struct {
+		ISBN      string `json:"isbn" binding:"required"`
+		Title     string `json:"title" binding:"required"`
+		Authors   string `json:"authors" binding:"required"`
+		Publisher string `json:"publisher" binding:"required"`
+		Version   string `json:"version" binding:"required"`
 	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT ReqID, BookID, ReaderID, RequestDate, ApprovalDate, ApproverID, RequestType FROM RequestEvents WHERE ApproverID = ? AND RequestType = 'issue'", userObj.ID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer rows.Close()
-
-	var requests []RequestEvent
-	for rows.Next() {
-		var req RequestEvent
-		var approvalDate sql.NullTime
-		var approverID sql.NullInt64
-		if err := rows.Scan(&req.ReqID, &req.BookID, &req.ReaderID, &req.RequestDate, &approvalDate, &approverID, &req.RequestType); err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
-			return
-		}
-
-		if approvalDate.Valid {
-			req.ApprovalDate = approvalDate.Time
-		} else {
-			req.ApprovalDate = time.Time{}
-		}
-
-		if approverID.Valid {
-			req.ApproverID = int(approverID.Int64)
-		} else {
-			req.ApproverID = 0
-		}
-
-		requests = append(requests, req)
-	}
-
-	c.JSON(http.StatusOK, requests)
-}
-
-// approveIssueRequest allows a library admin to approve or reject an issue request
-func approveIssueRequest(c *gin.Context) {
-	user, _ := c.Get("user")
-	userObj := user.(User)
-
-	reqID := c.Param("reqID")
-
-	var req RequestEvent
 	if err := c.BindJSON(&req); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
+		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	// Check if the request exists and if it's pending approval
-	var existingRequestID int
-	err = db.QueryRow("SELECT ReqID FROM RequestEvents WHERE ReqID = ? AND ApproverID IS NULL AND RequestType = 'issue'", reqID).Scan(&existingRequestID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Issue request not found or already approved/rejected"})
-		} else {
-			c.AbortWithError(http.StatusInternalServerError, err)
-		}
+	var book BookInventory
+	if err := db.Where("isbn = ?", req.ISBN).First(&book).Error; err != nil {
+		c.JSON(404, gin.H{"error": "Book not found"})
 		return
 	}
 
-	// Update the request status with approver ID and approval date
-	stmt, err := db.Prepare("UPDATE RequestEvents SET ApproverID = ?, ApprovalDate = ? WHERE ReqID = ?")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
+	// Update book details
+	book.Title = req.Title
+	book.Authors = req.Authors
+	book.Publisher = req.Publisher
+	book.Version = req.Version
 
-	_, err = stmt.Exec(userObj.ID, time.Now(), reqID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
+	if err := db.Save(&book).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to update book"})
 		return
 	}
 
-	if req.RequestType == "issue" {
-		// Update book inventory and issue registry if the request is approved
-		stmt, err := db.Prepare("UPDATE BookInventory SET AvailableCopies = AvailableCopies - 1 WHERE ISBN = (SELECT BookID FROM RequestEvents WHERE ReqID = ?)")
+	c.JSON(200, book)
+}
+
+// Function to list all issue requests in the library
+func listIssueRequests(c *gin.Context) {
+	var requests []RequestEvents
+	if err := db.Find(&requests).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch issue requests"})
+		return
+	}
+
+	if len(requests) == 0 {
+		c.JSON(404, gin.H{"error": "No issue requests found"})
+		return
+	}
+
+	c.JSON(200, requests)
+}
+
+func approveOrRejectIssueRequest(c *gin.Context) {
+	var req struct {
+		ReqID        uint   `json:"request_id" binding:"required"`
+		Approved     bool   `json:"approved"`
+		ApproverID   uint   `json:"approver_id" binding:"required"`
+		ApprovalDate string `json:"approval_date" binding:"required"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var request RequestEvents
+	if err := db.First(&request, req.ReqID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Request not found"})
+		return
+	}
+
+	var book BookInventory
+	if err := db.First(&book, request.BookID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		return
+	}
+
+	if req.Approved {
+		// Set request details if approved
+		request.ApproverID = &req.ApproverID
+		approvalDate, err := time.Parse(time.RFC3339, req.ApprovalDate)
 		if err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid approval date format"})
 			return
 		}
-		defer stmt.Close()
+		request.ApprovalDate = &approvalDate
 
-		_, err = stmt.Exec(reqID)
-		if err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
+		// Update request event with approval details
+		if err := db.Save(&request).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update request"})
 			return
 		}
 
-		stmt, err = db.Prepare("INSERT INTO IssueRegistry (ISBN, ReaderID, IssueApproverID, IssueStatus, IssueDate, ExpectedReturnDate) VALUES ((SELECT BookID FROM RequestEvents WHERE ReqID = ?), (SELECT ReaderID FROM RequestEvents WHERE ReqID = ?), ?, 'issued', ?, DATE('now', '+30 days'))")
-		if err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
+		// Update issue registry accordingly
+		newIssue := IssueRegistry{
+			ISBN:               book.ISBN,
+			ReaderID:           request.ReaderID,
+			IssueApproverID:    &req.ApproverID,
+			IssueStatus:        "Approved",
+			IssueDate:          time.Now(),
+			ExpectedReturnDate: time.Now().AddDate(0, 0, 7), // Example: Expected return date after 7 days
+		}
+		if err := db.Create(&newIssue).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update issue registry"})
 			return
 		}
-		defer stmt.Close()
 
-		_, err = stmt.Exec(reqID, reqID, userObj.ID, time.Now())
-		if err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
+		// Decrease available copies of the book by 1
+		book.AvailableCopies--
+		if err := db.Save(&book).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book inventory"})
+			return
+		}
+	} else {
+		// If rejected, delete the request
+		if err := db.Delete(&request).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete request"})
 			return
 		}
 	}
@@ -610,99 +407,68 @@ func approveIssueRequest(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Issue request updated successfully"})
 }
 
-func getReaderInfo(c *gin.Context) {
-	readerID := c.Param("readerID")
-
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
+// Reader APIs
+func searchBook(c *gin.Context) {
+	var req struct {
+		Title     string `json:"title"`
+		Author    string `json:"author"`
+		Publisher string `json:"publisher"`
 	}
-	defer db.Close()
-
-	var user User
-	err = db.QueryRow("SELECT ID, Name, Email, ContactNumber, Role, LibID FROM Users WHERE ID = ?", readerID).Scan(&user.ID, &user.Name, &user.Email, &user.ContactNumber, &user.Role, &user.LibID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-
-	c.JSON(http.StatusOK, user)
-}
-
-// issueBookRequest allows a reader to raise an issue request
-func issueBookRequest(c *gin.Context) {
-	user, _ := c.Get("user")
-	userObj := user.(User)
-
-	var req RequestEvent
 	if err := c.BindJSON(&req); err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
+		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	req.ReaderID = userObj.ID
-	req.RequestType = "issue"
-	req.RequestDate = time.Now()
-
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	// Check if the requested book is available
-	var availableCopies int
-	err = db.QueryRow("SELECT AvailableCopies FROM BookInventory WHERE LibID = ? AND ISBN = ? AND AvailableCopies > 0", userObj.LibID, req.BookID).Scan(&availableCopies)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Requested book is not available"})
-		return
-	}
-
-	stmt, err := db.Prepare("INSERT INTO RequestEvents (BookID, ReaderID, RequestDate, RequestType) VALUES (?, ?, ?, ?)")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(req.BookID, req.ReaderID, req.RequestDate, req.RequestType)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-
-	c.JSON(http.StatusOK, req)
-}
-
-// listAvailableBooks lists available books for the reader's library
-func listAvailableBooks(c *gin.Context) {
-	user, _ := c.Get("user")
-	userObj := user.(User)
-
-	db, err := sql.Open("sqlite3", "library.db")
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT ISBN, Title, Authors, Publisher, Version, AvailableCopies FROM BookInventory WHERE LibID = ? AND AvailableCopies > 0", userObj.LibID)
-	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	defer rows.Close()
 
 	var books []BookInventory
-	for rows.Next() {
-		var book BookInventory
-		if err := rows.Scan(&book.ISBN, &book.Title, &book.Authors, &book.Publisher, &book.Version, &book.AvailableCopies); err != nil {
-			c.AbortWithError(http.StatusInternalServerError, err)
-			return
-		}
-		books = append(books, book)
+	query := db.Model(&BookInventory{})
+	if req.Title != "" {
+		query = query.Where("title LIKE ?", "%"+req.Title+"%")
+	}
+	if req.Author != "" {
+		query = query.Where("authors LIKE ?", "%"+req.Author+"%")
+	}
+	if req.Publisher != "" {
+		query = query.Where("publisher LIKE ?", "%"+req.Publisher+"%")
+	}
+	if err := query.Find(&books).Error; err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
 	}
 
-	c.JSON(http.StatusOK, books)
+	if len(books) == 0 {
+		c.JSON(404, gin.H{"message": "No books found"})
+		return
+	}
+
+	c.JSON(200, books)
+}
+
+func raiseIssueRequest(c *gin.Context) {
+	var req struct {
+		BookID uint   `json:"book_id" binding:"required"`
+		Email  string `json:"email" binding:"required"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	var book BookInventory
+	if err := db.Where("id = ? AND available_copies > 0", req.BookID).First(&book).Error; err != nil {
+		c.JSON(400, gin.H{"error": "Book is not available"})
+		return
+	}
+
+	newRequest := RequestEvents{
+		BookID:      req.BookID,
+		ReaderID:    req.Email,
+		RequestDate: time.Now(),
+		RequestType: "Issue",
+	}
+	if err := db.Create(&newRequest).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Failed to raise issue request"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Issue request raised successfully"})
 }
